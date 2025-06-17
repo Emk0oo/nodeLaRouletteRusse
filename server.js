@@ -50,7 +50,25 @@ const questions = [
   },
   {
     id: 5,
-    question: "Quel est le plus grand océan du monde ?",
+    question: "Quel est le plus grand océan du monde ? 1",
+    options: ["Atlantique", "Pacifique", "Indien", "Arctique"],
+    correctAnswer: 1
+  },
+  {
+    id: 6,
+    question: "Quel est le plus grand océan du monde ? 2",
+    options: ["Atlantique", "Pacifique", "Indien", "Arctique"],
+    correctAnswer: 1
+  },
+  {
+    id: 7,
+    question: "Quel est le plus grand océan du monde ? AVANT DERNIERE",
+    options: ["Atlantique", "Pacifique", "Indien", "Arctique"],
+    correctAnswer: 1
+  },
+  {
+    id: 8,
+    question: "Quel est le plus grand océan du monde ? DERNIERE",
     options: ["Atlantique", "Pacifique", "Indien", "Arctique"],
     correctAnswer: 1
   }
@@ -76,7 +94,7 @@ io.on("connection", (socket) => {
       playerAnswers: new Map(),
       questionTimer: null,
       resultsTimer: null,
-      timeRemaining: 20,
+      timeRemaining: 2,
       createdAt: new Date(),
     });
 
@@ -102,8 +120,8 @@ io.on("connection", (socket) => {
     const player = {
       id: socket.id,
       name: playerName,
-      score: 7, // Score initial
-      previousScore: 7,
+      score: 2, // Score initial
+      previousScore: 2,
       hasAnswered: false,
       currentAnswer: null,
       lastPointChange: 0,
@@ -197,7 +215,7 @@ io.on("connection", (socket) => {
     });
 
     const currentQuestion = room.questions[room.currentQuestionIndex];
-    room.timeRemaining = 20;
+    room.timeRemaining = 2;
 
     // Envoyer la question
     io.to(gameId).emit("new-question", {
@@ -205,7 +223,7 @@ io.on("connection", (socket) => {
       options: currentQuestion.options,
       questionNumber: room.currentQuestionIndex + 1,
       totalQuestions: room.questions.length,
-      timeRemaining: 20
+      timeRemaining: 5
     });
 
     // Démarrer le compte à rebours
@@ -220,49 +238,116 @@ io.on("connection", (socket) => {
     }, 1000);
   }
 
-  function endQuestion(gameId) {
-    const room = rooms.get(gameId);
-    if (!room) return;
+function endQuestion(gameId) {
+  const room = rooms.get(gameId);
+  if (!room) return;
 
-    clearInterval(countdownInterval);
+  clearInterval(countdownInterval);
 
-    const currentQuestion = room.questions[room.currentQuestionIndex];
-    const correctAnswer = currentQuestion.correctAnswer;
+  const currentQuestion = room.questions[room.currentQuestionIndex];
+  const correctAnswer = currentQuestion.correctAnswer;
 
-    // Calculer les scores
-    room.players.forEach(player => {
-      if (player.hasAnswered && player.currentAnswer === correctAnswer) {
-        player.score += 1;
-        player.lastPointChange = 1;
-      } else {
-        player.score = Math.max(0, player.score - 1);
-        player.lastPointChange = -1;
-      }
+  // Calculer les scores
+  room.players.forEach(player => {
+    if (player.hasAnswered && player.currentAnswer === correctAnswer) {
+      player.score += 1;
+      player.lastPointChange = 1;
+    } else {
+      player.score = Math.max(0, player.score - 1);
+      player.lastPointChange = -1;
+    }
+  });
+
+  // Vérifier si des joueurs ont atteint 0 points
+  const eliminatedPlayers = room.players.filter(player => player.score <= 0);
+  
+  if (eliminatedPlayers.length > 0) {
+    // Marquer les joueurs éliminés
+    eliminatedPlayers.forEach(player => {
+      player.eliminated = true;
     });
 
-    // Préparer les résultats
-    const results = room.players.map(player => ({
+    // Si tous les joueurs sont éliminés ou il ne reste qu'un joueur
+    const activePlayers = room.players.filter(player => !player.eliminated);
+    
+    if (activePlayers.length <= 1) {
+      // Fin de partie immédiate
+      endGameWithElimination(gameId, eliminatedPlayers);
+      return;
+    }
+  }
+
+  // Préparer les résultats
+  const results = room.players.map(player => ({
+    playerId: player.id,
+    playerName: player.name,
+    answered: player.hasAnswered,
+    answer: player.currentAnswer,
+    isCorrect: player.hasAnswered && player.currentAnswer === correctAnswer,
+    previousScore: player.previousScore,
+    newScore: player.score,
+    pointChange: player.lastPointChange,
+    eliminated: player.eliminated || false
+  }));
+
+  // Envoyer les résultats avec les éliminations
+  io.to(gameId).emit("question-results", {
+    correctAnswer: correctAnswer,
+    results: results,
+    eliminatedPlayers: eliminatedPlayers.map(p => ({
+      playerId: p.id,
+      playerName: p.name
+    }))
+  });
+
+  // Attendre 10 secondes avant la prochaine question
+  room.resultsTimer = setTimeout(() => {
+    sendNextQuestion(gameId);
+  }, 10000);
+}
+
+// Nouvelle fonction pour gérer la fin de partie avec élimination
+function endGameWithElimination(gameId, eliminatedPlayers) {
+  const room = rooms.get(gameId);
+  if (!room) return;
+
+  room.status = "finished";
+  clearInterval(countdownInterval);
+  if (room.resultsTimer) clearTimeout(room.resultsTimer);
+
+  const activePlayers = room.players.filter(player => !player.eliminated);
+  const finalScores = room.players
+    .map(player => ({
       playerId: player.id,
       playerName: player.name,
-      answered: player.hasAnswered,
-      answer: player.currentAnswer,
-      isCorrect: player.hasAnswered && player.currentAnswer === correctAnswer,
-      previousScore: player.previousScore,
-      newScore: player.score,
-      pointChange: player.lastPointChange
-    }));
-
-    // Envoyer les résultats
-    io.to(gameId).emit("question-results", {
-      correctAnswer: correctAnswer,
-      results: results
+      score: player.score,
+      eliminated: player.eliminated || false
+    }))
+    .sort((a, b) => {
+      // Les joueurs non éliminés en premier, puis par score
+      if (a.eliminated && !b.eliminated) return 1;
+      if (!a.eliminated && b.eliminated) return -1;
+      return b.score - a.score;
     });
 
-    // Attendre 10 secondes avant la prochaine question
-    room.resultsTimer = setTimeout(() => {
-      sendNextQuestion(gameId);
-    }, 10000);
-  }
+  const winner = activePlayers.length > 0 ? activePlayers[0] : null;
+
+  io.to(gameId).emit("game-ended", {
+    finalScores: finalScores,
+    winner: winner ? {
+      playerId: winner.id,
+      playerName: winner.name,
+      score: winner.score
+    } : null,
+    reason: "elimination",
+    eliminatedPlayers: eliminatedPlayers.map(p => ({
+      playerId: p.id,
+      playerName: p.name
+    }))
+  });
+
+  console.log(`Partie ${gameId} terminée par élimination`);
+}
 
   function endGame(gameId) {
     const room = rooms.get(gameId);
