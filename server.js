@@ -5,9 +5,17 @@ import { Server } from "socket.io";
 const app = express();
 const server = createServer(app);
 
+// server.js - Mettre à jour la configuration CORS
 const io = new Server(server, {
   cors: {
-    origin: "*",
+    origin: [
+      "http://localhost:3000",
+      "https://la-roulette-russe.vercel.app",
+      /\.vercel\.app$/,
+      /localhost:\d+$/
+    ],
+    methods: ["GET", "POST"],
+    credentials: true
   },
 });
 
