@@ -1,6 +1,7 @@
 import express from "express";
 import { createServer } from "http";
 import { Server } from "socket.io";
+import { readFile } from 'fs/promises';
 
 const app = express();
 const server = createServer(app);
@@ -23,39 +24,9 @@ const io = new Server(server, {
 const rooms = new Map();
 
 // Questions d'exemple
-const questions = [
-  {
-    id: 1,
-    question: "Quelle est la capitale de la France ?",
-    options: ["Paris", "Londres", "Berlin", "Madrid"],
-    correctAnswer: 0
-  },
-  {
-    id: 2,
-    question: "Combien font 2 + 2 ?",
-    options: ["3", "4", "5", "6"],
-    correctAnswer: 1
-  },
-  {
-    id: 3,
-    question: "Quelle est la couleur du ciel ?",
-    options: ["Rouge", "Vert", "Bleu", "Jaune"],
-    correctAnswer: 2
-  },
-  {
-    id: 4,
-    question: "Combien y a-t-il de jours dans une semaine ?",
-    options: ["5", "6", "7", "8"],
-    correctAnswer: 2
-  },
-  {
-    id: 5,
-    question: "Quel est le plus grand océan du monde ?",
-    options: ["Atlantique", "Pacifique", "Indien", "Arctique"],
-    correctAnswer: 1
-  }
-];
 
+const data = await readFile('./questions.json', 'utf-8');
+const questions = JSON.parse(data);
 io.on("connection", (socket) => {
   console.log("Client connecté :", socket.id);
 
@@ -72,11 +43,10 @@ io.on("connection", (socket) => {
       players: [],
       status: "waiting",
       currentQuestionIndex: -1,
-      questions: [...questions],
       playerAnswers: new Map(),
       questionTimer: null,
       resultsTimer: null,
-      timeRemaining: 20,
+      timeRemaining: 2,
       createdAt: new Date(),
     });
 
@@ -88,6 +58,16 @@ io.on("connection", (socket) => {
   // Rejoindre une room
   socket.on("join-room", ({ gameId, playerName }) => {
     const room = rooms.get(gameId);
+
+    function shuffle(array) {
+      const copy = [...array];
+      for (let i = copy.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [copy[i], copy[j]] = [copy[j], copy[i]];
+      }
+      return copy;
+    }
+
 
     if (!room) {
       socket.emit("join-error", "Cette room n'existe pas");
@@ -102,13 +82,16 @@ io.on("connection", (socket) => {
     const player = {
       id: socket.id,
       name: playerName,
-      score: 7, // Score initial
+      score: 7,
       previousScore: 7,
       hasAnswered: false,
       currentAnswer: null,
       lastPointChange: 0,
       joinedAt: new Date(),
+      questions: shuffle(JSON.parse(data)), // 👈 Ajout ici
+      currentQuestionIndex: -1 // 👈 Pour suivre où il en est
     };
+
 
     room.players.push(player);
     socket.join(gameId);
@@ -176,39 +159,46 @@ io.on("connection", (socket) => {
 
   // Timer pour les questions
   let countdownInterval;
-  
+
   function sendNextQuestion(gameId) {
     const room = rooms.get(gameId);
     if (!room) return;
 
-    room.currentQuestionIndex++;
-
-    if (room.currentQuestionIndex >= room.questions.length) {
-      endGame(gameId);
-      return;
-    }
-
-    // Réinitialiser l'état des joueurs
+    // chaque joueur avance d'une question dans sa propre liste
     room.players.forEach(player => {
+      player.currentQuestionIndex++;
       player.hasAnswered = false;
       player.currentAnswer = null;
       player.previousScore = player.score;
       player.lastPointChange = 0;
     });
 
-    const currentQuestion = room.questions[room.currentQuestionIndex];
-    room.timeRemaining = 20;
+    const totalQuestions = room.players[0].questions.length; // même fichier pour tous
 
-    // Envoyer la question
-    io.to(gameId).emit("new-question", {
-      question: currentQuestion.question,
-      options: currentQuestion.options,
-      questionNumber: room.currentQuestionIndex + 1,
-      totalQuestions: room.questions.length,
-      timeRemaining: 20
+    // s'assurer que tous les joueurs n’ont pas terminé
+    const allFinished = room.players.every(p => p.currentQuestionIndex >= p.questions.length);
+    if (allFinished) {
+      endGame(gameId);
+      return;
+    }
+
+    // Envoyer à chacun sa propre question
+    room.players.forEach(player => {
+      if (player.currentQuestionIndex < player.questions.length) {
+        const q = player.questions[player.currentQuestionIndex];
+
+        io.to(player.id).emit("new-question", {
+          question: q.question,
+          options: q.options,
+          questionNumber: player.currentQuestionIndex + 1,
+          totalQuestions: totalQuestions,
+          timeRemaining: 2
+        });
+      }
     });
 
-    // Démarrer le compte à rebours
+    room.timeRemaining = 2;
+
     countdownInterval = setInterval(() => {
       room.timeRemaining--;
       io.to(gameId).emit("time-update", { timeRemaining: room.timeRemaining });
@@ -220,17 +210,19 @@ io.on("connection", (socket) => {
     }, 1000);
   }
 
+
   function endQuestion(gameId) {
     const room = rooms.get(gameId);
     if (!room) return;
 
     clearInterval(countdownInterval);
 
-    const currentQuestion = room.questions[room.currentQuestionIndex];
-    const correctAnswer = currentQuestion.correctAnswer;
+    const results = [];
 
-    // Calculer les scores
     room.players.forEach(player => {
+      const currentQuestion = player.questions[player.currentQuestionIndex];
+      const correctAnswer = currentQuestion.correctAnswer;
+
       if (player.hasAnswered && player.currentAnswer === correctAnswer) {
         player.score += 1;
         player.lastPointChange = 1;
@@ -238,31 +230,31 @@ io.on("connection", (socket) => {
         player.score = Math.max(0, player.score - 1);
         player.lastPointChange = -1;
       }
+
+      results.push({
+        playerId: player.id,
+        playerName: player.name,
+        answered: player.hasAnswered,
+        answer: player.currentAnswer,
+        isCorrect: player.hasAnswered && player.currentAnswer === correctAnswer,
+        previousScore: player.previousScore,
+        newScore: player.score,
+        pointChange: player.lastPointChange
+      });
+
+      // Envoyer la correction à chaque joueur individuellement
+      io.to(player.id).emit("question-results", {
+        correctAnswer,
+        result: results.find(r => r.playerId === player.id)
+      });
     });
 
-    // Préparer les résultats
-    const results = room.players.map(player => ({
-      playerId: player.id,
-      playerName: player.name,
-      answered: player.hasAnswered,
-      answer: player.currentAnswer,
-      isCorrect: player.hasAnswered && player.currentAnswer === correctAnswer,
-      previousScore: player.previousScore,
-      newScore: player.score,
-      pointChange: player.lastPointChange
-    }));
-
-    // Envoyer les résultats
-    io.to(gameId).emit("question-results", {
-      correctAnswer: correctAnswer,
-      results: results
-    });
-
-    // Attendre 10 secondes avant la prochaine question
+    // Passer à la question suivante après 10 secondes
     room.resultsTimer = setTimeout(() => {
       sendNextQuestion(gameId);
     }, 10000);
   }
+
 
   function endGame(gameId) {
     const room = rooms.get(gameId);
