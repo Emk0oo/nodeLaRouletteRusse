@@ -1,7 +1,7 @@
 import express from "express";
 import { createServer } from "http";
 import { Server } from "socket.io";
-import { readFile } from 'fs/promises';
+import { readFile } from "fs/promises";
 
 const app = express();
 const server = createServer(app);
@@ -13,22 +13,35 @@ const io = new Server(server, {
       "http://localhost:3000",
       "https://la-roulette-russe.vercel.app",
       /\.vercel\.app$/,
-      /localhost:\d+$/
+      /localhost:\d+$/,
     ],
     methods: ["GET", "POST"],
-    credentials: true
+    credentials: true,
   },
 });
 
 // Stockage des rooms et des joueurs
 const rooms = new Map();
 
-// Questions d'exemple
-
-const data = await readFile('./questions.json', 'utf-8');
+// Charger les questions
+const data = await readFile("./questions.json", "utf-8");
 const questions = JSON.parse(data);
+
 io.on("connection", (socket) => {
   console.log("Client connecté :", socket.id);
+
+  // Fonction utilitaire pour mélanger un tableau
+  function shuffle(array) {
+    const copy = [...array];
+    for (let i = copy.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [copy[i], copy[j]] = [copy[j], copy[i]];
+    }
+    return copy;
+  }
+
+  // Timer pour les questions
+  let countdownInterval;
 
   // Créer une nouvelle room
   socket.on("create-room", (gameId) => {
@@ -46,7 +59,7 @@ io.on("connection", (socket) => {
       playerAnswers: new Map(),
       questionTimer: null,
       resultsTimer: null,
-      timeRemaining: 2,
+      timeRemaining: 5,
       createdAt: new Date(),
     });
 
@@ -58,16 +71,6 @@ io.on("connection", (socket) => {
   // Rejoindre une room
   socket.on("join-room", ({ gameId, playerName }) => {
     const room = rooms.get(gameId);
-
-    function shuffle(array) {
-      const copy = [...array];
-      for (let i = copy.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [copy[i], copy[j]] = [copy[j], copy[i]];
-      }
-      return copy;
-    }
-
 
     if (!room) {
       socket.emit("join-error", "Cette room n'existe pas");
@@ -82,16 +85,16 @@ io.on("connection", (socket) => {
     const player = {
       id: socket.id,
       name: playerName,
-      score: 7,
-      previousScore: 7,
+      score: 2,
+      previousScore: 2,
       hasAnswered: false,
       currentAnswer: null,
       lastPointChange: 0,
+      eliminated: false,
       joinedAt: new Date(),
-      questions: shuffle(JSON.parse(data)), // 👈 Ajout ici
-      currentQuestionIndex: -1 // 👈 Pour suivre où il en est
+      questions: shuffle([...questions]), // Mélanger les questions pour chaque joueur
+      currentQuestionIndex: -1,
     };
-
 
     room.players.push(player);
     socket.join(gameId);
@@ -132,7 +135,9 @@ io.on("connection", (socket) => {
       sendNextQuestion(gameId);
     }, 3000);
 
-    console.log(`Partie ${gameId} démarrée avec ${room.players.length} joueurs`);
+    console.log(
+      `Partie ${gameId} démarrée avec ${room.players.length} joueurs`
+    );
   });
 
   // Recevoir une réponse
@@ -140,32 +145,38 @@ io.on("connection", (socket) => {
     const room = rooms.get(gameId);
     if (!room || room.status !== "playing") return;
 
-    const player = room.players.find(p => p.id === socket.id);
-    if (!player || player.hasAnswered) return;
+    const player = room.players.find((p) => p.id === socket.id);
+    if (!player || player.hasAnswered || player.eliminated) return;
 
     player.hasAnswered = true;
     player.currentAnswer = answer;
 
     // Notifier tous les clients qu'un joueur a répondu
+    const activePlayers = room.players.filter((p) => !p.eliminated);
     io.to(gameId).emit("player-answered", {
       playerId: player.id,
       playerName: player.name,
-      totalAnswered: room.players.filter(p => p.hasAnswered).length,
-      totalPlayers: room.players.length
+      totalAnswered: activePlayers.filter((p) => p.hasAnswered).length,
+      totalPlayers: activePlayers.length,
     });
 
     console.log(`${player.name} a répondu: ${answer}`);
   });
 
-  // Timer pour les questions
-  let countdownInterval;
-
   function sendNextQuestion(gameId) {
     const room = rooms.get(gameId);
     if (!room) return;
 
-    // chaque joueur avance d'une question dans sa propre liste
-    room.players.forEach(player => {
+    // Filtrer les joueurs actifs (non éliminés)
+    const activePlayers = room.players.filter((p) => !p.eliminated);
+
+    if (activePlayers.length === 0) {
+      endGame(gameId);
+      return;
+    }
+
+    // Chaque joueur actif avance d'une question dans sa propre liste
+    activePlayers.forEach((player) => {
       player.currentQuestionIndex++;
       player.hasAnswered = false;
       player.currentAnswer = null;
@@ -173,17 +184,19 @@ io.on("connection", (socket) => {
       player.lastPointChange = 0;
     });
 
-    const totalQuestions = room.players[0].questions.length; // même fichier pour tous
+    const totalQuestions = questions.length;
 
-    // s'assurer que tous les joueurs n’ont pas terminé
-    const allFinished = room.players.every(p => p.currentQuestionIndex >= p.questions.length);
+    // Vérifier si tous les joueurs actifs ont terminé leurs questions
+    const allFinished = activePlayers.every(
+      (p) => p.currentQuestionIndex >= p.questions.length
+    );
     if (allFinished) {
       endGame(gameId);
       return;
     }
 
-    // Envoyer à chacun sa propre question
-    room.players.forEach(player => {
+    // Envoyer à chaque joueur actif sa propre question
+    activePlayers.forEach((player) => {
       if (player.currentQuestionIndex < player.questions.length) {
         const q = player.questions[player.currentQuestionIndex];
 
@@ -192,13 +205,14 @@ io.on("connection", (socket) => {
           options: q.options,
           questionNumber: player.currentQuestionIndex + 1,
           totalQuestions: totalQuestions,
-          timeRemaining: 2
+          timeRemaining: 5,
         });
       }
     });
 
-    room.timeRemaining = 2;
+    room.timeRemaining = 5;
 
+    // Démarrer le compte à rebours
     countdownInterval = setInterval(() => {
       room.timeRemaining--;
       io.to(gameId).emit("time-update", { timeRemaining: room.timeRemaining });
@@ -210,17 +224,33 @@ io.on("connection", (socket) => {
     }, 1000);
   }
 
+  function endQuestion(gameId) {
+    const room = rooms.get(gameId);
+    if (!room) return;
 
-
-function endQuestion(gameId) {
-  const room = rooms.get(gameId);
-  if (!room) return;
-
-  clearInterval(countdownInterval);
+    clearInterval(countdownInterval);
 
     const results = [];
+    const eliminatedPlayers = [];
 
-    room.players.forEach(player => {
+    // Traiter chaque joueur
+    room.players.forEach((player) => {
+      // Ignorer les joueurs déjà éliminés
+      if (player.eliminated) {
+        results.push({
+          playerId: player.id,
+          playerName: player.name,
+          answered: false,
+          answer: null,
+          isCorrect: false,
+          previousScore: player.score,
+          newScore: player.score,
+          pointChange: 0,
+          eliminated: true,
+        });
+        return;
+      }
+
       const currentQuestion = player.questions[player.currentQuestionIndex];
       const correctAnswer = currentQuestion.correctAnswer;
 
@@ -232,6 +262,12 @@ function endQuestion(gameId) {
         player.lastPointChange = -1;
       }
 
+      // Vérifier si le joueur est éliminé
+      if (player.score <= 0) {
+        player.eliminated = true;
+        eliminatedPlayers.push(player);
+      }
+
       results.push({
         playerId: player.id,
         playerName: player.name,
@@ -240,15 +276,30 @@ function endQuestion(gameId) {
         isCorrect: player.hasAnswered && player.currentAnswer === correctAnswer,
         previousScore: player.previousScore,
         newScore: player.score,
-        pointChange: player.lastPointChange
-      });
-
-      // Envoyer la correction à chaque joueur individuellement
-      io.to(player.id).emit("question-results", {
-        correctAnswer,
-        result: results.find(r => r.playerId === player.id)
+        pointChange: player.lastPointChange,
+        eliminated: player.eliminated,
       });
     });
+
+    // Envoyer les résultats à tous les joueurs
+    io.to(gameId).emit("question-results", {
+      results: results,
+      eliminatedPlayers: eliminatedPlayers.map((p) => ({
+        playerId: p.id,
+        playerName: p.name,
+      })),
+    });
+
+    // Vérifier si il faut terminer le jeu
+    const activePlayers = room.players.filter((player) => !player.eliminated);
+
+    if (activePlayers.length <= 1) {
+      // Fin de partie par élimination
+      setTimeout(() => {
+        endGameWithElimination(gameId, eliminatedPlayers);
+      }, 10000);
+      return;
+    }
 
     // Passer à la question suivante après 10 secondes
     room.resultsTimer = setTimeout(() => {
@@ -256,54 +307,50 @@ function endQuestion(gameId) {
     }, 10000);
   }
 
-  // Attendre 10 secondes avant la prochaine question
-  room.resultsTimer = setTimeout(() => {
-    sendNextQuestion(gameId);
-  }, 10000);
-}
+  // Nouvelle fonction pour gérer la fin de partie avec élimination
+  function endGameWithElimination(gameId, eliminatedPlayers) {
+    const room = rooms.get(gameId);
+    if (!room) return;
 
-// Nouvelle fonction pour gérer la fin de partie avec élimination
-function endGameWithElimination(gameId, eliminatedPlayers) {
-  const room = rooms.get(gameId);
-  if (!room) return;
+    room.status = "finished";
+    clearInterval(countdownInterval);
+    if (room.resultsTimer) clearTimeout(room.resultsTimer);
 
-  room.status = "finished";
-  clearInterval(countdownInterval);
-  if (room.resultsTimer) clearTimeout(room.resultsTimer);
+    const activePlayers = room.players.filter((player) => !player.eliminated);
+    const finalScores = room.players
+      .map((player) => ({
+        playerId: player.id,
+        playerName: player.name,
+        score: player.score,
+        eliminated: player.eliminated || false,
+      }))
+      .sort((a, b) => {
+        // Les joueurs non éliminés en premier, puis par score
+        if (a.eliminated && !b.eliminated) return 1;
+        if (!a.eliminated && b.eliminated) return -1;
+        return b.score - a.score;
+      });
 
-  const activePlayers = room.players.filter(player => !player.eliminated);
-  const finalScores = room.players
-    .map(player => ({
-      playerId: player.id,
-      playerName: player.name,
-      score: player.score,
-      eliminated: player.eliminated || false
-    }))
-    .sort((a, b) => {
-      // Les joueurs non éliminés en premier, puis par score
-      if (a.eliminated && !b.eliminated) return 1;
-      if (!a.eliminated && b.eliminated) return -1;
-      return b.score - a.score;
+    const winner = activePlayers.length > 0 ? activePlayers[0] : null;
+
+    io.to(gameId).emit("game-ended", {
+      finalScores: finalScores,
+      winner: winner
+        ? {
+            playerId: winner.id,
+            playerName: winner.name,
+            score: winner.score,
+          }
+        : null,
+      reason: "elimination",
+      eliminatedPlayers: eliminatedPlayers.map((p) => ({
+        playerId: p.id,
+        playerName: p.name,
+      })),
     });
 
-  const winner = activePlayers.length > 0 ? activePlayers[0] : null;
-
-  io.to(gameId).emit("game-ended", {
-    finalScores: finalScores,
-    winner: winner ? {
-      playerId: winner.id,
-      playerName: winner.name,
-      score: winner.score
-    } : null,
-    reason: "elimination",
-    eliminatedPlayers: eliminatedPlayers.map(p => ({
-      playerId: p.id,
-      playerName: p.name
-    }))
-  });
-
-  console.log(`Partie ${gameId} terminée par élimination`);
-}
+    console.log(`Partie ${gameId} terminée par élimination`);
+  }
 
   function endGame(gameId) {
     const room = rooms.get(gameId);
@@ -314,16 +361,31 @@ function endGameWithElimination(gameId, eliminatedPlayers) {
     if (room.resultsTimer) clearTimeout(room.resultsTimer);
 
     const finalScores = room.players
-      .map(player => ({
+      .map((player) => ({
         playerId: player.id,
         playerName: player.name,
-        score: player.score
+        score: player.score,
+        eliminated: player.eliminated || false,
       }))
-      .sort((a, b) => b.score - a.score);
+      .sort((a, b) => {
+        // Les joueurs non éliminés en premier, puis par score
+        if (a.eliminated && !b.eliminated) return 1;
+        if (!a.eliminated && b.eliminated) return -1;
+        return b.score - a.score;
+      });
+
+    const winner =
+      finalScores.find((player) => !player.eliminated) || finalScores[0];
 
     io.to(gameId).emit("game-ended", {
       finalScores: finalScores,
-      winner: finalScores[0]
+      winner: winner
+        ? {
+            playerId: winner.playerId,
+            playerName: winner.playerName,
+            score: winner.score,
+          }
+        : null,
     });
 
     console.log(`Partie ${gameId} terminée`);
